@@ -759,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--_daemon-loop", action="store_true", help=argparse.SUPPRESS)
 
     # Positional: the command to run (used with -G)
-    p.add_argument("command", nargs="*", help="Command to queue (used with -G)")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="Command to queue (used with -G)")
 
     return p
 

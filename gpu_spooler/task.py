@@ -328,8 +328,13 @@ class Daemon:
                 f"{'─' * 60}\n"
             )
 
+        wdir = row['working_dir']
+        # `ls` the path first so autofs/NFS automounts have a chance to mount
+        # the filesystem before the cd. Without this, non-interactive SSH
+        # sessions see the directory as missing on automount-based systems.
         ssh_cmd = (
-            f"cd {row['working_dir']!r} && "
+            f"ls {wdir!r} > /dev/null 2>&1; "
+            f"cd {wdir!r} && "
             f"CUDA_VISIBLE_DEVICES={gpu_str} {row['command']}"
         )
         try:
@@ -457,7 +462,7 @@ def _truncate(s: str, n: int) -> str:
 
 def cmd_submit(args) -> None:
     command = " ".join(args.command)
-    working_dir = os.getcwd()
+    working_dir = os.path.abspath(args.dir) if args.dir else os.getcwd()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     con = db_open()
     cur = con.execute(
@@ -736,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-n", "--name", metavar="LABEL",
         help="Optional human-readable label for the task",
+    )
+    p.add_argument(
+        "-d", "--dir", metavar="PATH",
+        help="Working directory on the remote server (default: current directory)",
     )
 
     # ── Inspection ────────────────────────────────────────────────────────────

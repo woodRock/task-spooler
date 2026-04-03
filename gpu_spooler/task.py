@@ -718,6 +718,68 @@ def cmd_wait(args) -> None:
         print("\nStopped waiting (task still running).")
 
 
+def _run_on_server(server: str, command: str) -> tuple[bool, str]:
+    """SSH to a single server, run command, return (success, combined output)."""
+    try:
+        r = subprocess.run(
+            ["ssh",
+             "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "BatchMode=yes",
+             "-o", "LogLevel=ERROR",
+             server, command],
+            capture_output=True, text=True, timeout=300,
+        )
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return False, "SSH timed out after 300s"
+    except OSError as e:
+        return False, str(e)
+
+
+def cmd_run_all(args) -> None:
+    command = args.run_all
+    n = len(SERVERS)
+    print(f"{BOLD}Running on {n} servers:{RESET} {command}\n")
+
+    results: dict[str, tuple[bool, str]] = {}
+    lock = __import__("threading").Lock()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(_run_on_server, s, command): s for s in SERVERS}
+        for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
+            server = futures[f]
+            ok, output = f.result()
+            with lock:
+                results[server] = (ok, output)
+                status = _col("OK  ", GREEN) if ok else _col("FAIL", RED)
+                # Show the last non-empty line as a quick summary
+                last = next(
+                    (l for l in reversed(output.splitlines()) if l.strip()), ""
+                )
+                print(
+                    f"  [{i:>2}/{n}] {server:<16} {status}  {_truncate(last, 60)}",
+                    flush=True,
+                )
+
+    ok_count   = sum(1 for ok, _ in results.values() if ok)
+    fail_count = n - ok_count
+
+    # Print full output for failed servers
+    failures = [(s, out) for s, (ok, out) in results.items() if not ok]
+    if failures:
+        print(f"\n{_col(f'{fail_count} server(s) failed — full output:', RED)}")
+        for server, out in failures:
+            print(f"\n{BOLD}── {server} ──{RESET}")
+            print(out or "(no output)")
+
+    print(
+        f"\n{_col(str(ok_count), GREEN)}/{n} servers succeeded"
+        + (f"  {_col(str(fail_count) + ' failed', RED)}" if fail_count else "")
+        + "\n"
+    )
+
+
 def cmd_gpu_status(args) -> None:
     from gpu_spooler.gpu_status import main as _gpu_status_main
     _gpu_status_main()
@@ -760,6 +822,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-w", "--wait",  metavar="ID", type=int, help="Block until a task finishes")
 
     # ── GPU / daemon ──────────────────────────────────────────────────────────
+    p.add_argument("-R", "--run-all", metavar="CMD",
+                   help="Run a shell command on every GPU server in parallel and report results")
     p.add_argument("--gpu-status", action="store_true", help="Show GPU availability across servers")
     p.add_argument("--daemon",     action="store_true", help="Start daemon (if not already running)")
     p.add_argument("--stop",       action="store_true", help="Stop the background daemon")
@@ -805,6 +869,8 @@ def main() -> None:
         cmd_clear(args)
     elif args.wait is not None:
         args.id = args.wait;   cmd_wait(args)
+    elif args.run_all:
+        cmd_run_all(args)
     elif args.gpu_status:
         cmd_gpu_status(args)
     elif args.daemon:

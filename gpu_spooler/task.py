@@ -783,19 +783,19 @@ def main() -> None:
     elif args.list:
         cmd_list(args)
     elif args.info is not None:
-        cmd_info(args)
+        args.id = args.info;   cmd_info(args)
     elif args.output is not None:
-        cmd_output(args)
+        args.id = args.output; cmd_output(args)
     elif args.follow is not None:
-        cmd_follow(args)
+        args.id = args.follow; cmd_follow(args)
     elif args.kill is not None:
-        cmd_kill(args)
+        args.id = args.kill;   cmd_kill(args)
     elif args.kill_all:
         cmd_kill_all(args)
     elif args.clear:
         cmd_clear(args)
     elif args.wait is not None:
-        cmd_wait(args)
+        args.id = args.wait;   cmd_wait(args)
     elif args.gpu_status:
         cmd_gpu_status(args)
     elif args.daemon:

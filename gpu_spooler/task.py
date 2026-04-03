@@ -338,8 +338,13 @@ class Daemon:
             f"cd {wdir!r} && "
             f"CUDA_VISIBLE_DEVICES={gpu_str} {row['command']}"
         )
-        # Wrap in a login shell so ~/.bashrc / conda / venv PATH are loaded
-        ssh_cmd = f"bash -l -c {shlex.quote(inner)}"
+        # Use a login shell AND explicitly source ~/.bashrc.
+        # bash -l sources /etc/profile and ~/.bash_profile, but on most Linux
+        # systems ~/.local/bin (where pip --user installs) is only added to
+        # PATH inside ~/.bashrc, which is only sourced for interactive shells.
+        # Sourcing it explicitly here ensures user-installed commands are found.
+        wrapped = f"source ~/.bashrc 2>/dev/null || true; {inner}"
+        ssh_cmd = f"bash -l -c {shlex.quote(wrapped)}"
         try:
             log_fh = open(log_path, "a")
             proc = subprocess.Popen(
@@ -730,7 +735,7 @@ def _run_on_server(server: str, command: str) -> tuple[bool, str]:
              "-o", "StrictHostKeyChecking=no",
              "-o", "BatchMode=yes",
              "-o", "LogLevel=ERROR",
-             server, f"bash -l -c {shlex.quote(command)}"],
+             server, f"bash -l -c {shlex.quote('source ~/.bashrc 2>/dev/null || true; ' + command)}"],
             capture_output=True, text=True, timeout=300,
         )
         return r.returncode == 0, (r.stdout + r.stderr).strip()

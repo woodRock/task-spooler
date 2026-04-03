@@ -17,6 +17,7 @@ Inspection:
 
 Management:
   task -k 3 / --kill 3                   kill / cancel task 3
+  task -ka  / --kill-all                 kill all running & queued tasks, stop daemon
   task -c   / --clear                    remove finished tasks from the list
   task -w 3 / --wait 3                   block until task 3 finishes
 
@@ -655,6 +656,37 @@ def cmd_kill(args) -> None:
         print(f"Task {args.id} marked as killed.")
 
 
+def cmd_kill_all(args) -> None:
+    con = db_open()
+    now = time.time()
+
+    # Cancel all queued tasks
+    n_queued = con.execute(
+        "UPDATE tasks SET status='cancelled', finished_at=? WHERE status='queued'",
+        (now,),
+    ).rowcount
+
+    # Kill all running tasks
+    running = con.execute(
+        "SELECT id, ssh_pid FROM tasks WHERE status='running'"
+    ).fetchall()
+    for r in running:
+        if r["ssh_pid"]:
+            try:
+                os.kill(r["ssh_pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    n_running = con.execute(
+        "UPDATE tasks SET status='killed', finished_at=?, ssh_pid=NULL WHERE status='running'",
+        (now,),
+    ).rowcount
+    con.commit()
+
+    print(f"Cancelled {n_queued} queued task(s), killed {n_running} running task(s).")
+    if daemon_is_running():
+        stop_daemon()
+
+
 def cmd_clear(args) -> None:
     con = db_open()
     n = con.execute(
@@ -713,7 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-f", "--follow", metavar="ID", type=int, help="Stream live output of a task")
 
     # ── Management ───────────────────────────────────────────────────────────
-    p.add_argument("-k", "--kill",  metavar="ID", type=int, help="Kill or cancel a task")
+    p.add_argument("-k",  "--kill",     metavar="ID", type=int, help="Kill or cancel a task")
+    p.add_argument("-ka", "--kill-all", action="store_true",   help="Kill all running and queued tasks and stop the daemon")
     p.add_argument("-c", "--clear", action="store_true", help="Remove finished tasks from the list")
     p.add_argument("-w", "--wait",  metavar="ID", type=int, help="Block until a task finishes")
 
@@ -757,6 +790,8 @@ def main() -> None:
         cmd_follow(args)
     elif args.kill is not None:
         cmd_kill(args)
+    elif args.kill_all:
+        cmd_kill_all(args)
     elif args.clear:
         cmd_clear(args)
     elif args.wait is not None:

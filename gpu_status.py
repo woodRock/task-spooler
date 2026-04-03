@@ -90,7 +90,7 @@ class GpuInfo:
 
     @property
     def is_free(self) -> bool:
-        return len(self.processes) == 0 and self.mem_used_mb < 256  # <256 MiB = effectively free
+        return len(self.processes) == 0
 
 @dataclass
 class ServerResult:
@@ -124,25 +124,27 @@ class ServerResult:
 # ---------------------------------------------------------------------------
 
 # Single bash command run remotely; sections delimited by sentinel lines.
+# Uses `nvidia-smi pmon` (not --query-compute-apps) so that ALL GPU processes
+# are detected — compute, graphics, OpenCL, display, etc.
 REMOTE_CMD = r"""
 GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu \
     --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR: nvidia-smi failed"; exit 1; }
 
-APP_OUT=$(nvidia-smi --query-compute-apps=gpu_index,pid,used_memory \
-    --format=csv,noheader,nounits 2>/dev/null)
+PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
 
-PIDS=$(echo "$APP_OUT" | awk -F',' 'NF>=2{gsub(/ /,"",$2); print $2}' | sort -u | tr '\n' ',')
+# Extract unique PIDs from pmon (skip header comment lines, skip '-' no-process entries)
+PIDS=$(echo "$PMON_OUT" | awk 'NR>2 && $2~/^[0-9]+$/{print $2}' | sort -u | tr '\n' ',')
 PIDS="${PIDS%,}"
 
-printf 'GPU_INFO\n%s\nAPP_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$APP_OUT"
+printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$PMON_OUT"
 if [ -n "$PIDS" ]; then
-    ps -o pid=,user=,args= -p "$PIDS" 2>/dev/null || true
+    ps -o pid=,user= -p "$PIDS" 2>/dev/null || true
 fi
 printf 'END\n'
 """
 
 
-def ssh_run(server: str, timeout: int = 20) -> tuple[bool, str]:
+def ssh_run(server: str, timeout: int = 20, debug: bool = False) -> tuple[bool, str]:
     """SSH to server and run the remote collection script."""
     try:
         result = subprocess.run(
@@ -159,6 +161,12 @@ def ssh_run(server: str, timeout: int = 20) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
+        if debug:
+            print(f"\n--- RAW OUTPUT FROM {server} ---")
+            print(result.stdout or "(empty stdout)")
+            if result.stderr:
+                print(f"STDERR: {result.stderr.strip()}")
+            print(f"--- END {server} (exit={result.returncode}) ---\n")
         if result.returncode != 0 and not result.stdout:
             return False, result.stderr.strip() or f"ssh exited {result.returncode}"
         return True, result.stdout
@@ -170,18 +178,19 @@ def ssh_run(server: str, timeout: int = 20) -> tuple[bool, str]:
 
 def parse_output(raw: str) -> list[GpuInfo]:
     """Parse the structured output from REMOTE_CMD into GpuInfo objects."""
-    sections: dict[str, list[str]] = {"GPU_INFO": [], "APP_INFO": [], "PROC_INFO": []}
+    SENTINELS = {"GPU_INFO", "PMON_INFO", "PROC_INFO"}
+    sections: dict[str, list[str]] = {s: [] for s in SENTINELS}
     current = None
     for line in raw.splitlines():
-        if line in sections:
-            current = line
-        elif line == "END":
+        stripped = line.rstrip("\r")          # tolerate \r\n from some SSH configs
+        if stripped in SENTINELS:
+            current = stripped
+        elif stripped == "END":
             break
-        elif current:
-            if line.strip():
-                sections[current].append(line)
+        elif current and stripped.strip():
+            sections[current].append(stripped)
 
-    # --- GPU rows ---
+    # --- GPU rows (CSV from --query-gpu) ---
     gpus: dict[int, GpuInfo] = {}
     for line in sections["GPU_INFO"]:
         parts = [p.strip() for p in line.split(",")]
@@ -202,65 +211,54 @@ def parse_output(raw: str) -> list[GpuInfo]:
         except (ValueError, IndexError):
             continue
 
-    # --- compute app rows -> map pid -> gpu_index + mem ---
-    pid_to_gpu: dict[int, tuple[int, int]] = {}  # pid -> (gpu_idx, mem_mb)
-    for line in sections["APP_INFO"]:
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 3:
+    # --- pmon rows: gpu pid type sm% mem% enc% dec% fb_mb command ---
+    # Header lines start with '#'; skip them.  A '-' pid means no process.
+    # Example data line:  "    0    1234    C   45   23    0    0  400  python3"
+    pid_to_gpu: dict[int, tuple[int, int, str]] = {}  # pid -> (gpu_idx, fb_mb, cmd_name)
+    for line in sections["PMON_INFO"]:
+        if line.lstrip().startswith("#"):
             continue
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        if not parts[1].isdigit():
+            continue                          # '-' entry = no process on this GPU
         try:
             gpu_idx = int(parts[0])
-            pid = int(parts[1])
-            mem = int(parts[2])
-            pid_to_gpu[pid] = (gpu_idx, mem)
+            pid     = int(parts[1])
+            fb_mb   = int(parts[7]) if parts[7].isdigit() else 0
+            cmd     = parts[8]               # pmon already gives the command name
+            pid_to_gpu[pid] = (gpu_idx, fb_mb, cmd)
         except (ValueError, IndexError):
             continue
 
-    # --- process info rows ---
-    pid_info: dict[int, tuple[str, str]] = {}  # pid -> (user, command)
+    # --- proc info rows: pid user (we asked ps for pid= user= only) ---
+    pid_user: dict[int, str] = {}
     for line in sections["PROC_INFO"]:
-        parts = line.split(None, 2)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-            user = parts[1]
-            # Keep just the last component of the path and first 60 chars
-            cmd_full = parts[2] if len(parts) > 2 else ""
-            # Extract script name: last path component of first token
-            first_token = cmd_full.split()[0] if cmd_full.split() else ""
-            script = first_token.split("/")[-1]
-            # If it's an interpreter (python/python3/bash/sh/perl/ruby/julia),
-            # include the next argument as the script being run.
-            interpreters = {"python", "python3", "python2", "bash", "sh",
-                            "perl", "ruby", "julia", "Rscript", "node"}
-            if script in interpreters:
-                tokens = cmd_full.split()
-                # skip flags (tokens starting with -)
-                extra = [t for t in tokens[1:] if not t.startswith("-")]
-                if extra:
-                    script = script + " " + extra[0].split("/")[-1]
-            pid_info[pid] = (user, script[:60])
-        except (ValueError, IndexError):
-            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                pid_user[int(parts[0])] = parts[1]
+            except ValueError:
+                continue
 
     # --- attach processes to GPUs ---
-    for pid, (gpu_idx, mem_mb) in pid_to_gpu.items():
+    for pid, (gpu_idx, fb_mb, cmd) in pid_to_gpu.items():
         if gpu_idx not in gpus:
             continue
-        user, cmd = pid_info.get(pid, ("?", "?"))
+        user = pid_user.get(pid, "?")
         gpus[gpu_idx].processes.append(GpuProcess(
             pid=pid,
             user=user,
-            mem_used_mb=mem_mb,
-            command=cmd,
+            mem_used_mb=fb_mb,
+            command=cmd[:60],
         ))
 
     return list(gpus.values())
 
 
-def query_server(server: str) -> ServerResult:
-    ok, output = ssh_run(server)
+def query_server(server: str, debug: bool = False) -> ServerResult:
+    ok, output = ssh_run(server, debug=debug)
     if not ok:
         return ServerResult(name=server, reachable=False, error=output)
     if output.startswith("ERROR:"):
@@ -451,6 +449,10 @@ def main() -> None:
         "--workers", "-w", type=int, default=16,
         help="Number of parallel SSH workers (default: 16)"
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Print raw SSH output for each server (useful for diagnosing parse issues)"
+    )
     args = parser.parse_args()
 
     targets = [args.server] if args.server else SERVERS
@@ -459,7 +461,7 @@ def main() -> None:
 
     results: list[ServerResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(query_server, s): s for s in targets}
+        futures = {pool.submit(query_server, s, args.debug): s for s in targets}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             server = futures[future]
             result = future.result()

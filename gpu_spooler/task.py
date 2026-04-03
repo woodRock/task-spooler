@@ -696,8 +696,15 @@ def cmd_kill_all(args) -> None:
     con.commit()
 
     print(f"Cancelled {n_queued} queued task(s), killed {n_running} running task(s).")
+
     if daemon_is_running():
         stop_daemon()
+
+    # Wipe all tasks and reset the ID counter so the next run starts from 1
+    con.execute("DELETE FROM tasks")
+    con.execute("DELETE FROM sqlite_sequence WHERE name='tasks'")
+    con.commit()
+    print("Task history cleared. Next task will be ID 1.")
 
 
 def cmd_clear(args) -> None:

@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""
+task - GPU task spooler for VUW ECS GPU servers
+
+The background daemon auto-starts on first job submission and dispatches
+queued tasks to GPU servers as GPUs become free.
+
+Submission:
+  task -G 1 python3 train.py             queue a job needing 1 GPU
+  task -G 2 -n "experiment A" ./run.sh   queue with a label
+
+Inspection:
+  task -l  / --list                      list all tasks
+  task -i 3 / --info 3                   detailed info for task 3
+  task -o 3 / --output 3                 print saved output of task 3
+  task -f 3 / --follow 3                 stream live output of task 3
+
+Management:
+  task -k 3 / --kill 3                   kill / cancel task 3
+  task -c   / --clear                    remove finished tasks from the list
+  task -w 3 / --wait 3                   block until task 3 finishes
+
+GPU / daemon:
+  task --gpu-status                      show GPU availability across all servers
+  task --stop                            stop the background daemon
+  task --daemon                          (re)start the daemon explicitly
+"""
+
+import argparse
+import concurrent.futures
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+STATE_DIR  = Path.home() / ".task-spooler"
+DB_PATH    = STATE_DIR / "tasks.db"
+PID_FILE   = STATE_DIR / "daemon.pid"
+DAEMON_LOG = STATE_DIR / "daemon.log"
+LOGS_DIR   = STATE_DIR / "logs"
+
+POLL_INTERVAL = 30   # seconds between GPU polls in daemon
+SSH_TIMEOUT   = 15   # seconds for GPU-check SSH calls
+
+# ── Server catalogue ──────────────────────────────────────────────────────────
+
+SERVERS = [
+    "cuda-small0", "cuda-small1",
+    "cuda00", "cuda01", "cuda02", "cuda03", "cuda04", "cuda05", "cuda06",
+    "cuda07", "cuda08", "cuda09", "cuda10", "cuda11", "cuda12", "cuda13",
+    "cuda14", "cuda15", "cuda16", "cuda17", "cuda18", "cuda19", "cuda20",
+    "cuda21", "cuda22",
+    "gryphon", "red-tomatoes", "piccolo", "the-villa", "bordeaux",
+]
+
+SERVER_INFO = {
+    "cuda-small0":  {"gpu_type": "RTX A4000",    "num_gpus": 4, "gpu_mem_gb": 16},
+    "cuda-small1":  {"gpu_type": "RTX 4000 Ada", "num_gpus": 3, "gpu_mem_gb": 20},
+    "cuda00":       {"gpu_type": "RTX 6000",     "num_gpus": 2, "gpu_mem_gb": 24},
+    "cuda01":       {"gpu_type": "RTX A5000",    "num_gpus": 2, "gpu_mem_gb": 24},
+    "cuda02":       {"gpu_type": "RTX A5000",    "num_gpus": 2, "gpu_mem_gb": 24},
+    "cuda03":       {"gpu_type": "RTX A5000",    "num_gpus": 2, "gpu_mem_gb": 24},
+    "cuda04":       {"gpu_type": "RTX A5000",    "num_gpus": 2, "gpu_mem_gb": 24},
+    "cuda05":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda06":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda07":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda08":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda09":       {"gpu_type": "RTX 6000",     "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda10":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda11":       {"gpu_type": "RTX A5000",    "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda12":       {"gpu_type": "RTX 6000",     "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda13":       {"gpu_type": "RTX 6000",     "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda14":       {"gpu_type": "A40",          "num_gpus": 4, "gpu_mem_gb": 48},
+    "cuda15":       {"gpu_type": "A40",          "num_gpus": 4, "gpu_mem_gb": 48},
+    "cuda16":       {"gpu_type": "RTX A6000",    "num_gpus": 3, "gpu_mem_gb": 48},
+    "cuda17":       {"gpu_type": "RTX 6000",     "num_gpus": 3, "gpu_mem_gb": 24},
+    "cuda18":       {"gpu_type": "RTX A6000",    "num_gpus": 3, "gpu_mem_gb": 48},
+    "cuda19":       {"gpu_type": "L4",           "num_gpus": 4, "gpu_mem_gb": 24},
+    "cuda20":       {"gpu_type": "L40S",         "num_gpus": 4, "gpu_mem_gb": 48},
+    "cuda21":       {"gpu_type": "RTX 6000 Ada", "num_gpus": 2, "gpu_mem_gb": 48},
+    "cuda22":       {"gpu_type": "RTX 6000 Ada", "num_gpus": 2, "gpu_mem_gb": 48},
+    "gryphon":      {"gpu_type": "RTX A6000",    "num_gpus": 1, "gpu_mem_gb": 48},
+    "red-tomatoes": {"gpu_type": "RTX A6000",    "num_gpus": 2, "gpu_mem_gb": 48},
+    "piccolo":      {"gpu_type": "RTX A5000",    "num_gpus": 2, "gpu_mem_gb": 24},
+    "the-villa":    {"gpu_type": "RTX A6000",    "num_gpus": 1, "gpu_mem_gb": 48},
+    "bordeaux":     {"gpu_type": "RTX 6000",     "num_gpus": 1, "gpu_mem_gb": 24},
+}
+
+# ── GPU querying ──────────────────────────────────────────────────────────────
+
+_REMOTE_CMD = r"""
+GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR"; exit 1; }
+PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
+PIDS=$(echo "$PMON_OUT" | awk 'NR>2 && $2~/^[0-9]+$/{print $2}' | sort -u | tr '\n' ',')
+PIDS="${PIDS%,}"
+printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$PMON_OUT"
+if [ -n "$PIDS" ]; then ps -o pid=,user= -p "$PIDS" 2>/dev/null || true; fi
+printf 'END\n'
+"""
+
+
+def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
+    """
+    Return {gpu_index: is_free} for every GPU on a server, or None if unreachable.
+    """
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+             server, _REMOTE_CMD],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT + 5,
+        )
+        if r.returncode != 0 and not r.stdout:
+            return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    SENTINELS = {"GPU_INFO", "PMON_INFO", "PROC_INFO"}
+    sections: dict[str, list[str]] = {s: [] for s in SENTINELS}
+    cur = None
+    for line in r.stdout.splitlines():
+        s = line.rstrip("\r")
+        if s in SENTINELS:
+            cur = s
+        elif s == "END":
+            break
+        elif cur and s.strip():
+            sections[cur].append(s)
+
+    gpus: dict[int, bool] = {}
+    for line in sections["GPU_INFO"]:
+        parts = [p.strip() for p in line.split(",")]
+        try:
+            gpus[int(parts[0])] = True
+        except (ValueError, IndexError):
+            pass
+
+    for line in sections["PMON_INFO"]:
+        if line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            try:
+                gpus[int(parts[0])] = False
+            except ValueError:
+                pass
+
+    return gpus
+
+
+def query_all_servers() -> dict[str, dict[int, bool]]:
+    """Query all servers in parallel. Returns {server: {gpu_idx: is_free}}."""
+    out: dict[str, dict[int, bool]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(_query_server_free_gpus, s): s for s in SERVERS}
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result is not None:
+                out[futures[f]] = result
+    return out
+
+
+def assign_tasks(task_rows, server_gpus: dict[str, dict[int, bool]]) -> list[tuple]:
+    """
+    Greedily assign tasks (in queue order) to servers with free GPUs.
+    Mutates server_gpus to mark assigned GPUs as reserved.
+    Returns list of (task_id, server, [gpu_indices]).
+    """
+    # Sort servers: prefer those with fewer total GPUs (bin-pack fuller servers first)
+    servers_by_size = sorted(
+        server_gpus.keys(),
+        key=lambda s: SERVER_INFO.get(s, {}).get("num_gpus", 99),
+    )
+    assignments = []
+    for row in task_rows:
+        n = row["num_gpus"]
+        for server in servers_by_size:
+            free = [i for i, ok in sorted(server_gpus[server].items()) if ok]
+            if len(free) >= n:
+                chosen = free[:n]
+                for idx in chosen:
+                    server_gpus[server][idx] = False   # reserve
+                assignments.append((row["id"], server, chosen))
+                break
+    return assignments
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    command      TEXT    NOT NULL,
+    num_gpus     INTEGER NOT NULL DEFAULT 1,
+    status       TEXT    NOT NULL DEFAULT 'queued',
+    server       TEXT,
+    gpu_indices  TEXT,
+    ssh_pid      INTEGER,
+    submitted_at REAL    NOT NULL,
+    started_at   REAL,
+    finished_at  REAL,
+    exit_code    INTEGER,
+    log_file     TEXT,
+    working_dir  TEXT    NOT NULL,
+    name         TEXT
+);
+"""
+
+
+def db_open() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(_SCHEMA)
+    return con
+
+# ── Daemon ────────────────────────────────────────────────────────────────────
+
+class Daemon:
+    """
+    Background process that dispatches queued tasks to GPU servers
+    and monitors running SSH subprocesses for completion.
+    """
+
+    def __init__(self):
+        self.con = db_open()
+        # {task_id: (proc, log_file_handle)}
+        self._running: dict[int, tuple[subprocess.Popen, object]] = {}
+
+    def _log(self, msg: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] {msg}", flush=True)
+
+    def run(self) -> None:
+        self._log("Daemon started.")
+        # Mark any tasks left in 'running' state (from a previous daemon) as lost
+        n = self.con.execute(
+            "UPDATE tasks SET status='lost', finished_at=? WHERE status='running'",
+            (time.time(),),
+        ).rowcount
+        if n:
+            self._log(f"Marked {n} orphaned task(s) as 'lost'.")
+        self.con.commit()
+
+        while True:
+            try:
+                self._reap_finished()
+                self._dispatch()
+            except Exception as e:
+                self._log(f"Error in daemon loop: {e}")
+            time.sleep(POLL_INTERVAL)
+
+    def _reap_finished(self) -> None:
+        """Check running SSH subprocesses for completion."""
+        done = []
+        for tid, (proc, log_fh) in self._running.items():
+            rc = proc.poll()
+            if rc is not None:
+                log_fh.close()
+                status = "done" if rc == 0 else "failed"
+                self.con.execute(
+                    "UPDATE tasks SET status=?, exit_code=?, finished_at=?, ssh_pid=NULL "
+                    "WHERE id=?",
+                    (status, rc, time.time(), tid),
+                )
+                self.con.commit()
+                self._log(f"Task {tid} finished — exit {rc} ({status}).")
+                done.append(tid)
+        for tid in done:
+            del self._running[tid]
+
+    def _dispatch(self) -> None:
+        """Query servers and start queued tasks on free GPUs."""
+        rows = self.con.execute(
+            "SELECT * FROM tasks WHERE status='queued' ORDER BY id"
+        ).fetchall()
+        if not rows:
+            return
+
+        self._log(f"Polling GPU servers for {len(rows)} queued task(s)...")
+        server_gpus = query_all_servers()
+        if not server_gpus:
+            self._log("No reachable servers.")
+            return
+
+        assignments = assign_tasks(rows, server_gpus)
+        if not assignments:
+            self._log("No free GPU slots available; tasks remain queued.")
+            return
+
+        for task_id, server, gpu_indices in assignments:
+            self._launch(task_id, server, gpu_indices)
+
+    def _launch(self, task_id: int, server: str, gpu_indices: list[int]) -> None:
+        row = self.con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            return
+
+        gpu_str  = ",".join(str(i) for i in gpu_indices)
+        log_path = LOGS_DIR / f"{task_id}.log"
+
+        # Reserve in DB immediately (prevents double-dispatch on next cycle)
+        self.con.execute(
+            "UPDATE tasks SET status='running', server=?, gpu_indices=?, "
+            "started_at=?, log_file=? WHERE id=?",
+            (server, gpu_str, time.time(), str(log_path), task_id),
+        )
+        self.con.commit()
+
+        # Write a header to the log
+        with open(log_path, "w") as f:
+            f.write(
+                f"# task {task_id}: {row['command']}\n"
+                f"# server: {server}  CUDA_VISIBLE_DEVICES: {gpu_str}\n"
+                f"# started: {datetime.now().isoformat()}\n"
+                f"# working_dir: {row['working_dir']}\n"
+                f"{'─' * 60}\n"
+            )
+
+        ssh_cmd = (
+            f"cd {row['working_dir']!r} && "
+            f"CUDA_VISIBLE_DEVICES={gpu_str} {row['command']}"
+        )
+        try:
+            log_fh = open(log_path, "a")
+            proc = subprocess.Popen(
+                ["ssh",
+                 "-o", "BatchMode=yes",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ServerAliveInterval=60",
+                 "-o", "ServerAliveCountMax=3",
+                 server, ssh_cmd],
+                stdout=log_fh,
+                stderr=log_fh,
+            )
+            self._running[task_id] = (proc, log_fh)
+            self.con.execute(
+                "UPDATE tasks SET ssh_pid=? WHERE id=?", (proc.pid, task_id)
+            )
+            self.con.commit()
+            self._log(
+                f"Task {task_id} dispatched → {server} "
+                f"[CUDA_VISIBLE_DEVICES={gpu_str}]  (SSH PID {proc.pid})"
+            )
+        except Exception as e:
+            log_fh.close()
+            self.con.execute(
+                "UPDATE tasks SET status='failed', finished_at=? WHERE id=?",
+                (time.time(), task_id),
+            )
+            self.con.commit()
+            self._log(f"Task {task_id} failed to launch: {e}")
+
+# ── Daemon process management ─────────────────────────────────────────────────
+
+def daemon_is_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)   # signal 0 = check existence only
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def start_daemon(quiet: bool = False) -> None:
+    if daemon_is_running():
+        if not quiet:
+            print("Daemon is already running.")
+        return
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--_daemon-loop"],
+        stdout=open(DAEMON_LOG, "a"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,   # detach from terminal
+        close_fds=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    if not quiet:
+        print(f"Daemon started (PID {proc.pid}). Logs: {DAEMON_LOG}")
+
+
+def stop_daemon() -> None:
+    if not daemon_is_running():
+        print("Daemon is not running.")
+        return
+    pid = int(PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        PID_FILE.unlink(missing_ok=True)
+        print(f"Daemon (PID {pid}) stopped.")
+    except ProcessLookupError:
+        PID_FILE.unlink(missing_ok=True)
+        print("Daemon was not running (cleaned up stale PID file).")
+
+# ── CLI helpers ───────────────────────────────────────────────────────────────
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+CYAN   = "\033[96m"
+DIM    = "\033[2m"
+ORANGE = "\033[33m"
+
+STATUS_COLOR = {
+    "queued":    DIM,
+    "running":   GREEN,
+    "done":      CYAN,
+    "failed":    RED,
+    "killed":    YELLOW,
+    "cancelled": YELLOW,
+    "lost":      ORANGE,
+}
+
+
+def _col(text: str, color: str) -> str:
+    return f"{color}{text}{RESET}"
+
+
+def _fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None or seconds < 0:
+        return "-"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def _truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_submit(args) -> None:
+    command = " ".join(args.command)
+    working_dir = os.getcwd()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    con = db_open()
+    cur = con.execute(
+        "INSERT INTO tasks (command, num_gpus, submitted_at, working_dir, name) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (command, args.gpus, time.time(), working_dir, args.name),
+    )
+    con.commit()
+    task_id = cur.lastrowid
+    label = f'  "{args.name}"' if args.name else ""
+    print(f"Queued task {task_id}{label}: {command}")
+    print(f"  Requires: {args.gpus} GPU(s)   Working dir: {working_dir}")
+
+    start_daemon(quiet=True)
+
+    daemon_status = (
+        _col("running", GREEN) if daemon_is_running()
+        else _col("NOT running — start with: task --daemon", RED)
+    )
+    print(f"  Daemon: {daemon_status}")
+
+
+def cmd_list(args) -> None:
+    con = db_open()
+    rows = con.execute(
+        "SELECT * FROM tasks ORDER BY id DESC LIMIT 200"
+    ).fetchall()
+    if not rows:
+        print("No tasks.")
+        return
+
+    hdr = (
+        f"{'ID':>4}  {'STATUS':10}  {'G':>1}  {'SERVER':<14}  "
+        f"{'GPU':>4}  {'SUBMITTED':11}  {'RUNTIME':>8}  LABEL / COMMAND"
+    )
+    sep = "─" * max(len(hdr), 80)
+    print(f"\n{BOLD}{hdr}{RESET}")
+    print(sep)
+
+    for r in reversed(rows):
+        status  = r["status"]
+        color   = STATUS_COLOR.get(status, "")
+        started = r["started_at"]
+        ended   = r["finished_at"] or (time.time() if status == "running" else None)
+        runtime = _fmt_duration((ended - started) if started and ended else None)
+        label   = _truncate(r["name"] or r["command"], 42)
+        server  = r["server"] or "-"
+        gpus    = r["gpu_indices"] or "-"
+
+        print(
+            f"{r['id']:>4}  {_col(f'{status:10}', color)}  {r['num_gpus']:>1}  "
+            f"{server:<14}  {gpus:>4}  {_fmt_ts(r['submitted_at']):11}  "
+            f"{runtime:>8}  {label}"
+        )
+
+    print(sep)
+    total = len(rows)
+    running = sum(1 for r in rows if r["status"] == "running")
+    queued  = sum(1 for r in rows if r["status"] == "queued")
+    daemon_str = (
+        _col("running", GREEN) if daemon_is_running()
+        else _col("stopped", RED)
+    )
+    print(
+        f"\n{total} task(s)  "
+        f"{_col(str(running), GREEN)} running  "
+        f"{_col(str(queued), YELLOW)} queued  "
+        f"daemon: {daemon_str}\n"
+    )
+
+
+def cmd_info(args) -> None:
+    con = db_open()
+    r = con.execute("SELECT * FROM tasks WHERE id=?", (args.id,)).fetchone()
+    if not r:
+        print(f"Task {args.id} not found.")
+        sys.exit(1)
+
+    status = r["status"]
+    color  = STATUS_COLOR.get(status, "")
+    started  = r["started_at"]
+    finished = r["finished_at"]
+    runtime  = _fmt_duration((finished or time.time()) - started if started else None)
+
+    print(f"\n{BOLD}Task {r['id']}{RESET}")
+    print(f"  Status:      {_col(status, color)}")
+    if r["name"]:
+        print(f"  Label:       {r['name']}")
+    print(f"  Command:     {r['command']}")
+    print(f"  GPUs req:    {r['num_gpus']}")
+    print(f"  Working dir: {r['working_dir']}")
+    print(f"  Submitted:   {_fmt_ts(r['submitted_at'])}")
+    if r["server"]:
+        print(f"  Server:      {r['server']}")
+        info = SERVER_INFO.get(r["server"], {})
+        if info:
+            print(f"               ({info.get('gpu_type','')}  {info.get('gpu_mem_gb','')} GB/GPU)")
+    if r["gpu_indices"]:
+        print(f"  GPU indices: {r['gpu_indices']}")
+    if started:
+        print(f"  Started:     {_fmt_ts(started)}")
+    if finished:
+        print(f"  Finished:    {_fmt_ts(finished)}")
+    if started:
+        print(f"  Runtime:     {runtime}")
+    if r["exit_code"] is not None:
+        print(f"  Exit code:   {r['exit_code']}")
+    if r["log_file"]:
+        print(f"  Log file:    {r['log_file']}")
+    print()
+
+
+def cmd_output(args) -> None:
+    con = db_open()
+    r = con.execute("SELECT log_file, status FROM tasks WHERE id=?", (args.id,)).fetchone()
+    if not r:
+        print(f"Task {args.id} not found.")
+        sys.exit(1)
+    if not r["log_file"] or not Path(r["log_file"]).exists():
+        print(f"No output log for task {args.id} yet.")
+        sys.exit(1)
+    print(Path(r["log_file"]).read_text())
+
+
+def cmd_follow(args) -> None:
+    con = db_open()
+    r = con.execute("SELECT log_file, status FROM tasks WHERE id=?", (args.id,)).fetchone()
+    if not r:
+        print(f"Task {args.id} not found.")
+        sys.exit(1)
+
+    log = r["log_file"]
+    status = r["status"]
+
+    # Wait for the log file to appear if task is queued/starting
+    if not log or not Path(log).exists():
+        if status in ("queued", "running"):
+            print(f"Task {args.id} has not started yet. Waiting...", flush=True)
+            for _ in range(60):   # wait up to 60 s
+                time.sleep(1)
+                r = con.execute(
+                    "SELECT log_file, status FROM tasks WHERE id=?", (args.id,)
+                ).fetchone()
+                log = r["log_file"]
+                if log and Path(log).exists():
+                    break
+            else:
+                print("Timed out waiting for task to start.")
+                sys.exit(1)
+        else:
+            print(f"No output log for task {args.id}.")
+            sys.exit(1)
+
+    # tail -f equivalent
+    print(f"Following task {args.id} (Ctrl+C to stop)...\n")
+    try:
+        proc = subprocess.run(["tail", "-n", "+1", "-f", log])
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_kill(args) -> None:
+    con = db_open()
+    r = con.execute("SELECT * FROM tasks WHERE id=?", (args.id,)).fetchone()
+    if not r:
+        print(f"Task {args.id} not found.")
+        sys.exit(1)
+
+    status = r["status"]
+    if status in ("done", "failed", "killed", "cancelled"):
+        print(f"Task {args.id} is already {status}.")
+        return
+
+    if status == "queued":
+        con.execute(
+            "UPDATE tasks SET status='cancelled', finished_at=? WHERE id=?",
+            (time.time(), args.id),
+        )
+        con.commit()
+        print(f"Task {args.id} cancelled.")
+        return
+
+    if status == "running":
+        ssh_pid = r["ssh_pid"]
+        if ssh_pid:
+            try:
+                os.kill(ssh_pid, signal.SIGTERM)
+                print(f"Sent SIGTERM to SSH client (PID {ssh_pid}).")
+            except ProcessLookupError:
+                print("SSH process already gone.")
+        con.execute(
+            "UPDATE tasks SET status='killed', finished_at=?, ssh_pid=NULL WHERE id=?",
+            (time.time(), args.id),
+        )
+        con.commit()
+        print(f"Task {args.id} marked as killed.")
+
+
+def cmd_clear(args) -> None:
+    con = db_open()
+    n = con.execute(
+        "DELETE FROM tasks WHERE status IN ('done','failed','killed','cancelled','lost')"
+    ).rowcount
+    con.commit()
+    print(f"Removed {n} finished task(s).")
+
+
+def cmd_wait(args) -> None:
+    con = db_open()
+    print(f"Waiting for task {args.id} to finish (Ctrl+C to stop waiting)...")
+    try:
+        while True:
+            r = con.execute("SELECT status FROM tasks WHERE id=?", (args.id,)).fetchone()
+            if not r:
+                print(f"Task {args.id} not found.")
+                sys.exit(1)
+            if r["status"] not in ("queued", "running"):
+                print(f"Task {args.id} finished: {r['status']}")
+                return
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\nStopped waiting (task still running).")
+
+
+def cmd_gpu_status(args) -> None:
+    # Try to delegate to gpu_status.py if it's in the same directory
+    gpu_status_path = Path(__file__).parent / "gpu_status.py"
+    if gpu_status_path.exists():
+        os.execv(sys.executable, [sys.executable, str(gpu_status_path)])
+    else:
+        # Inline minimal version
+        print("Querying servers...")
+        server_gpus = query_all_servers()
+        total = sum(len(v) for v in server_gpus.values())
+        free  = sum(1 for v in server_gpus.values() for ok in v.values() if ok)
+        print(f"\nReachable servers: {len(server_gpus)}")
+        print(f"Total GPUs: {total}   Free: {free}   Busy: {total - free}")
+        for server in sorted(server_gpus):
+            v = server_gpus[server]
+            free_idx = [str(i) for i, ok in sorted(v.items()) if ok]
+            busy_idx = [str(i) for i, ok in sorted(v.items()) if not ok]
+            info = SERVER_INFO.get(server, {})
+            print(
+                f"  {server:<14} {info.get('gpu_type',''):<16}  "
+                f"free=[{','.join(free_idx) or '-'}]  "
+                f"busy=[{','.join(busy_idx) or '-'}]"
+            )
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="task",
+        description="GPU task spooler for VUW ECS GPU servers.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+        add_help=True,
+    )
+
+    # ── Submission ────────────────────────────────────────────────────────────
+    p.add_argument(
+        "-G", "--gpus", metavar="N", type=int,
+        help="Number of GPUs required (submit mode)",
+    )
+    p.add_argument(
+        "-n", "--name", metavar="LABEL",
+        help="Optional human-readable label for the task",
+    )
+
+    # ── Inspection ────────────────────────────────────────────────────────────
+    p.add_argument("-l", "--list",   action="store_true", help="List all tasks")
+    p.add_argument("-i", "--info",   metavar="ID", type=int, help="Detailed info for a task")
+    p.add_argument("-o", "--output", metavar="ID", type=int, help="Print saved output of a task")
+    p.add_argument("-f", "--follow", metavar="ID", type=int, help="Stream live output of a task")
+
+    # ── Management ───────────────────────────────────────────────────────────
+    p.add_argument("-k", "--kill",  metavar="ID", type=int, help="Kill or cancel a task")
+    p.add_argument("-c", "--clear", action="store_true", help="Remove finished tasks from the list")
+    p.add_argument("-w", "--wait",  metavar="ID", type=int, help="Block until a task finishes")
+
+    # ── GPU / daemon ──────────────────────────────────────────────────────────
+    p.add_argument("--gpu-status", action="store_true", help="Show GPU availability across servers")
+    p.add_argument("--daemon",     action="store_true", help="Start daemon (if not already running)")
+    p.add_argument("--stop",       action="store_true", help="Stop the background daemon")
+
+    # Internal: daemon loop (not for user use)
+    p.add_argument("--_daemon-loop", action="store_true", help=argparse.SUPPRESS)
+
+    # Positional: the command to run (used with -G)
+    p.add_argument("command", nargs="*", help="Command to queue (used with -G)")
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Internal: run the actual daemon loop
+    if args._daemon_loop:
+        Daemon().run()
+        return
+
+    # Route to the appropriate command
+    if args._daemon_loop:
+        Daemon().run()
+    elif args.gpus is not None:
+        if not args.command:
+            parser.error("-G requires a command, e.g.: task -G 1 python3 train.py")
+        cmd_submit(args)
+    elif args.list:
+        cmd_list(args)
+    elif args.info is not None:
+        cmd_info(args)
+    elif args.output is not None:
+        cmd_output(args)
+    elif args.follow is not None:
+        cmd_follow(args)
+    elif args.kill is not None:
+        cmd_kill(args)
+    elif args.clear:
+        cmd_clear(args)
+    elif args.wait is not None:
+        cmd_wait(args)
+    elif args.gpu_status:
+        cmd_gpu_status(args)
+    elif args.daemon:
+        start_daemon()
+    elif args.stop:
+        stop_daemon()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

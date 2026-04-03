@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-spooler"
+version = "0.1.0"
+description = "GPU task spooler for VUW ECS GPU servers"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.scripts]
+task = "gpu_spooler.task:main"
+gpu-status = "gpu_spooler.gpu_status:main"

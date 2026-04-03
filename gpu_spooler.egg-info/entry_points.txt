@@ -1,0 +1,3 @@
+[console_scripts]
+gpu-status = gpu_spooler.gpu_status:main
+task = gpu_spooler.task:main

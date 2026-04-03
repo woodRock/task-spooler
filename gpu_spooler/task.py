@@ -682,28 +682,8 @@ def cmd_wait(args) -> None:
 
 
 def cmd_gpu_status(args) -> None:
-    # Try to delegate to gpu_status.py if it's in the same directory
-    gpu_status_path = Path(__file__).parent / "gpu_status.py"
-    if gpu_status_path.exists():
-        os.execv(sys.executable, [sys.executable, str(gpu_status_path)])
-    else:
-        # Inline minimal version
-        print("Querying servers...")
-        server_gpus = query_all_servers()
-        total = sum(len(v) for v in server_gpus.values())
-        free  = sum(1 for v in server_gpus.values() for ok in v.values() if ok)
-        print(f"\nReachable servers: {len(server_gpus)}")
-        print(f"Total GPUs: {total}   Free: {free}   Busy: {total - free}")
-        for server in sorted(server_gpus):
-            v = server_gpus[server]
-            free_idx = [str(i) for i, ok in sorted(v.items()) if ok]
-            busy_idx = [str(i) for i, ok in sorted(v.items()) if not ok]
-            info = SERVER_INFO.get(server, {})
-            print(
-                f"  {server:<14} {info.get('gpu_type',''):<16}  "
-                f"free=[{','.join(free_idx) or '-'}]  "
-                f"busy=[{','.join(busy_idx) or '-'}]"
-            )
+    from gpu_spooler.gpu_status import main as _gpu_status_main
+    _gpu_status_main()
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 

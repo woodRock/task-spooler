@@ -17,7 +17,7 @@ Inspection:
 
 Management:
   task -k 3 / --kill 3                   kill / cancel task 3
-  task -ka  / --kill-all                 kill all running & queued tasks, stop daemon
+  task -K   / --kill-all                 kill all running & queued tasks, stop daemon
   task -c   / --clear                    remove finished tasks from the list
   task -w 3 / --wait 3                   block until task 3 finishes
 
@@ -30,6 +30,7 @@ GPU / daemon:
 import argparse
 import concurrent.futures
 import os
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -332,11 +333,13 @@ class Daemon:
         # `ls` the path first so autofs/NFS automounts have a chance to mount
         # the filesystem before the cd. Without this, non-interactive SSH
         # sessions see the directory as missing on automount-based systems.
-        ssh_cmd = (
+        inner = (
             f"ls {wdir!r} > /dev/null 2>&1; "
             f"cd {wdir!r} && "
             f"CUDA_VISIBLE_DEVICES={gpu_str} {row['command']}"
         )
+        # Wrap in a login shell so ~/.bashrc / conda / venv PATH are loaded
+        ssh_cmd = f"bash -l -c {shlex.quote(inner)}"
         try:
             log_fh = open(log_path, "a")
             proc = subprocess.Popen(
@@ -727,7 +730,7 @@ def _run_on_server(server: str, command: str) -> tuple[bool, str]:
              "-o", "StrictHostKeyChecking=no",
              "-o", "BatchMode=yes",
              "-o", "LogLevel=ERROR",
-             server, command],
+             server, f"bash -l -c {shlex.quote(command)}"],
             capture_output=True, text=True, timeout=300,
         )
         return r.returncode == 0, (r.stdout + r.stderr).strip()
@@ -817,7 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Management ───────────────────────────────────────────────────────────
     p.add_argument("-k",  "--kill",     metavar="ID", type=int, help="Kill or cancel a task")
-    p.add_argument("-ka", "--kill-all", action="store_true",   help="Kill all running and queued tasks and stop the daemon")
+    p.add_argument("-K", "--kill-all", action="store_true",    help="Kill all running and queued tasks and stop the daemon")
     p.add_argument("-c", "--clear", action="store_true", help="Remove finished tasks from the list")
     p.add_argument("-w", "--wait",  metavar="ID", type=int, help="Block until a task finishes")
 

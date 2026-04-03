@@ -295,6 +295,19 @@ class Daemon:
             self._log("No reachable servers.")
             return
 
+        # Mark GPUs claimed by our own running tasks as busy, even if nvidia-smi
+        # hasn't picked them up yet (newly launched tasks have a visibility lag).
+        running = self.con.execute(
+            "SELECT server, gpu_indices FROM tasks WHERE status='running'"
+        ).fetchall()
+        for r in running:
+            if r["server"] in server_gpus and r["gpu_indices"]:
+                for idx_str in r["gpu_indices"].split(","):
+                    try:
+                        server_gpus[r["server"]][int(idx_str)] = False
+                    except (ValueError, KeyError):
+                        pass
+
         assignments = assign_tasks(rows, server_gpus)
         if not assignments:
             self._log("No free GPU slots available; tasks remain queued.")

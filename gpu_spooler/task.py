@@ -10,7 +10,8 @@ Submission:
   task -G 2 -n "experiment A" ./run.sh   queue with a label
 
 Inspection:
-  task -l  / --list                      list all tasks
+  task -l  / --list                      list tasks (most recent 200)
+  task -L  / --all                       list all tasks (no limit)
   task -i 3 / --info 3                   detailed info for task 3
   task -o 3 / --output 3                 print saved output of task 3
   task -f 3 / --follow 3                 stream live output of task 3
@@ -564,9 +565,9 @@ def cmd_submit(args) -> None:
 
 def cmd_list(args) -> None:
     con = db_open()
-    rows = con.execute(
-        "SELECT * FROM tasks ORDER BY id DESC LIMIT 200"
-    ).fetchall()
+    limit = getattr(args, "all", False)
+    query = "SELECT * FROM tasks ORDER BY id DESC" + ("" if limit else " LIMIT 200")
+    rows = con.execute(query).fetchall()
     if not rows:
         print("No tasks.")
         return
@@ -596,15 +597,17 @@ def cmd_list(args) -> None:
         )
 
     print(sep)
-    total = len(rows)
-    running = sum(1 for r in rows if r["status"] == "running")
-    queued  = sum(1 for r in rows if r["status"] == "queued")
+    shown = len(rows)
+    total = con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    running = con.execute("SELECT COUNT(*) FROM tasks WHERE status='running'").fetchone()[0]
+    queued  = con.execute("SELECT COUNT(*) FROM tasks WHERE status='queued'").fetchone()[0]
     daemon_str = (
         _col("running", GREEN) if daemon_is_running()
         else _col("stopped", RED)
     )
+    truncated = f"  {_col(f'(showing {shown} of {total})', DIM)}" if shown < total else ""
     print(
-        f"\n{total} task(s)  "
+        f"\n{total} task(s){truncated}  "
         f"{_col(str(running), GREEN)} running  "
         f"{_col(str(queued), YELLOW)} queued  "
         f"daemon: {daemon_str}\n"
@@ -896,7 +899,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # ── Inspection ────────────────────────────────────────────────────────────
-    p.add_argument("-l", "--list",   action="store_true", help="List all tasks")
+    p.add_argument("-l", "--list",   action="store_true", help="List tasks (most recent 200)")
+    p.add_argument("-L", "--all",    action="store_true", help="List all tasks (no limit)")
     p.add_argument("-i", "--info",   metavar="ID", type=int, help="Detailed info for a task")
     p.add_argument("-o", "--output", metavar="ID", type=int, help="Print saved output of a task")
     p.add_argument("-f", "--follow", metavar="ID", type=int, help="Stream live output of a task")
@@ -939,7 +943,7 @@ def main() -> None:
         if not args.command:
             parser.error("-G requires a command, e.g.: task -G 1 python3 train.py")
         cmd_submit(args)
-    elif args.list:
+    elif args.list or args.all:
         cmd_list(args)
     elif args.info is not None:
         args.id = args.info;   cmd_info(args)

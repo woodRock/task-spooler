@@ -212,9 +212,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     exit_code    INTEGER,
     log_file     TEXT,
     working_dir  TEXT    NOT NULL,
-    name         TEXT
+    name         TEXT,
+    retry_count  INTEGER NOT NULL DEFAULT 0
 );
 """
+
+MAX_RETRIES = 3
 
 
 def db_open() -> sqlite3.Connection:
@@ -224,6 +227,11 @@ def db_open() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(_SCHEMA)
+    # Migrate existing DBs that pre-date the retry_count column
+    cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+    if "retry_count" not in cols:
+        con.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        con.commit()
     return con
 
 # ── Daemon ────────────────────────────────────────────────────────────────────
@@ -269,14 +277,42 @@ class Daemon:
             rc = proc.poll()
             if rc is not None:
                 log_fh.close()
-                status = "done" if rc == 0 else "failed"
-                self.con.execute(
-                    "UPDATE tasks SET status=?, exit_code=?, finished_at=?, ssh_pid=NULL "
-                    "WHERE id=?",
-                    (status, rc, time.time(), tid),
-                )
-                self.con.commit()
-                self._log(f"Task {tid} finished — exit {rc} ({status}).")
+                if rc == 0:
+                    self.con.execute(
+                        "UPDATE tasks SET status='done', exit_code=?, finished_at=?, ssh_pid=NULL "
+                        "WHERE id=?",
+                        (rc, time.time(), tid),
+                    )
+                    self.con.commit()
+                    self._log(f"Task {tid} finished — exit {rc} (done).")
+                else:
+                    row = self.con.execute(
+                        "SELECT retry_count FROM tasks WHERE id=?", (tid,)
+                    ).fetchone()
+                    retry_count = row["retry_count"] if row else MAX_RETRIES
+                    if retry_count < MAX_RETRIES:
+                        self.con.execute(
+                            "UPDATE tasks SET status='queued', exit_code=?, ssh_pid=NULL, "
+                            "started_at=NULL, finished_at=NULL, server=NULL, gpu_indices=NULL, "
+                            "retry_count=retry_count+1 WHERE id=?",
+                            (rc, tid),
+                        )
+                        self.con.commit()
+                        self._log(
+                            f"Task {tid} failed (exit {rc}), "
+                            f"re-queuing (attempt {retry_count + 1}/{MAX_RETRIES})."
+                        )
+                    else:
+                        self.con.execute(
+                            "UPDATE tasks SET status='failed', exit_code=?, finished_at=?, "
+                            "ssh_pid=NULL WHERE id=?",
+                            (rc, time.time(), tid),
+                        )
+                        self.con.commit()
+                        self._log(
+                            f"Task {tid} failed (exit {rc}), "
+                            f"no more retries ({MAX_RETRIES}/{MAX_RETRIES})."
+                        )
                 done.append(tid)
         for tid in done:
             del self._running[tid]
@@ -381,12 +417,32 @@ class Daemon:
             )
         except Exception as e:
             log_fh.close()
-            self.con.execute(
-                "UPDATE tasks SET status='failed', finished_at=? WHERE id=?",
-                (time.time(), task_id),
-            )
-            self.con.commit()
-            self._log(f"Task {task_id} failed to launch: {e}")
+            row = self.con.execute(
+                "SELECT retry_count FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            retry_count = row["retry_count"] if row else MAX_RETRIES
+            if retry_count < MAX_RETRIES:
+                self.con.execute(
+                    "UPDATE tasks SET status='queued', ssh_pid=NULL, "
+                    "started_at=NULL, finished_at=NULL, server=NULL, gpu_indices=NULL, "
+                    "retry_count=retry_count+1 WHERE id=?",
+                    (task_id,),
+                )
+                self.con.commit()
+                self._log(
+                    f"Task {task_id} failed to launch: {e} — "
+                    f"re-queuing (attempt {retry_count + 1}/{MAX_RETRIES})."
+                )
+            else:
+                self.con.execute(
+                    "UPDATE tasks SET status='failed', finished_at=? WHERE id=?",
+                    (time.time(), task_id),
+                )
+                self.con.commit()
+                self._log(
+                    f"Task {task_id} failed to launch: {e} — "
+                    f"no more retries ({MAX_RETRIES}/{MAX_RETRIES})."
+                )
 
 # ── Daemon process management ─────────────────────────────────────────────────
 
@@ -591,6 +647,8 @@ def cmd_info(args) -> None:
         print(f"  Runtime:     {runtime}")
     if r["exit_code"] is not None:
         print(f"  Exit code:   {r['exit_code']}")
+    if r["retry_count"]:
+        print(f"  Retries:     {r['retry_count']}/{MAX_RETRIES}")
     if r["log_file"]:
         print(f"  Log file:    {r['log_file']}")
     print()

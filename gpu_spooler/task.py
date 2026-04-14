@@ -100,9 +100,8 @@ SERVER_INFO = {
 
 _REMOTE_CMD = r"""
 GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu,compute_mode \
-    --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR"; exit 1; }
+    --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR: nvidia-smi failed"; exit 1; }
 PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
-# Get PIDs from compute apps as well, more reliable than pmon for idle processes
 APPS_OUT=$(nvidia-smi --query-compute-apps=gpu_index,pid --format=csv,noheader 2>/dev/null)
 printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nAPPS_INFO\n%s\n' "$GPU_OUT" "$PMON_OUT" "$APPS_OUT"
 printf 'END\n'
@@ -115,18 +114,18 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
     """
     try:
         r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+            ["ssh", "-o", "ConnectTimeout=10",
              "-o", "StrictHostKeyChecking=no",
              "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
              server, _REMOTE_CMD],
-            capture_output=True, text=True, timeout=SSH_TIMEOUT + 5,
+            capture_output=True, text=True, timeout=20,
         )
-        if r.returncode != 0 and not r.stdout:
+        if not r.stdout:
             return None
     except (subprocess.TimeoutExpired, OSError):
         return None
 
-    SENTINELS = {"GPU_INFO", "PMON_INFO", "APPS_INFO", "PROC_INFO"}
+    SENTINELS = {"GPU_INFO", "PMON_INFO", "APPS_INFO"}
     sections: dict[str, list[str]] = {s: [] for s in SENTINELS}
     cur = None
     for line in r.stdout.splitlines():
@@ -138,15 +137,17 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
         elif cur and s.strip():
             sections[cur].append(s)
 
+    if not sections["GPU_INFO"]:
+        return None
+
     gpus: dict[int, bool] = {}
     for line in sections["GPU_INFO"]:
         parts = [p.strip() for p in line.split(",")]
         try:
             idx = int(parts[0])
             mem_used = int(parts[2])
-            # Consider GPU busy if > 128MB VRAM is used, even if no process is in pmon
-            # Stricter than before (256MB) to catch even small idle contexts.
-            gpus[idx] = (mem_used < 128)
+            # Consider GPU busy if > 256MB VRAM is used
+            gpus[idx] = (mem_used < 256)
         except (ValueError, IndexError):
             pass
 
@@ -158,16 +159,16 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
         if len(parts) >= 2 and parts[1].isdigit():
             try:
                 gpus[int(parts[0])] = False
-            except ValueError:
+            except (ValueError, KeyError, IndexError):
                 pass
 
-    # Mark busy if any process is seen in compute apps (catches idle contexts)
+    # Mark busy if any process is seen in compute apps
     for line in sections["APPS_INFO"]:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 2 and parts[0].isdigit():
             try:
                 gpus[int(parts[0])] = False
-            except ValueError:
+            except (ValueError, KeyError, IndexError):
                 pass
 
     return gpus
@@ -199,7 +200,13 @@ def assign_tasks(task_rows, server_gpus: dict[str, dict[int, bool]]) -> list[tup
     assignments = []
     for row in task_rows:
         n = row["num_gpus"]
-        min_mem = row.get("min_mem", 0) or 0
+        # sqlite3.Row doesn't support .get(), use bracket access
+        try:
+            min_mem = row["min_mem"]
+        except (IndexError, KeyError, sqlite3.OperationalError):
+            min_mem = 0
+        min_mem = min_mem or 0
+        
         for server in servers_by_size:
             info = SERVER_INFO.get(server, {})
             if info.get("gpu_mem_gb", 0) < min_mem:
@@ -350,24 +357,26 @@ class Daemon:
 
         self._log(f"Polling GPU servers for {len(rows)} queued task(s)...")
         server_gpus = query_all_servers()
-        if not server_gpus:
-            self._log("No reachable servers.")
+        
+        # Filter out unreachable servers (those that returned None)
+        reachable = {s: g for s, g in server_gpus.items() if g is not None}
+        if not reachable:
+            self._log("No reachable servers (check SSH keys/agent).")
             return
 
-        # Mark GPUs claimed by our own running tasks as busy, even if nvidia-smi
-        # hasn't picked them up yet (newly launched tasks have a visibility lag).
+        # Mark GPUs claimed by our own running tasks as busy
         running = self.con.execute(
             "SELECT server, gpu_indices FROM tasks WHERE status='running'"
         ).fetchall()
         for r in running:
-            if r["server"] in server_gpus and r["gpu_indices"]:
+            if r["server"] in reachable and r["gpu_indices"]:
                 for idx_str in r["gpu_indices"].split(","):
                     try:
-                        server_gpus[r["server"]][int(idx_str)] = False
+                        reachable[r["server"]][int(idx_str)] = False
                     except (ValueError, KeyError):
                         pass
 
-        assignments = assign_tasks(rows, server_gpus)
+        assignments = assign_tasks(rows, reachable)
         if not assignments:
             self._log("No free GPU slots available; tasks remain queued.")
             return

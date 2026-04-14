@@ -918,7 +918,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of GPUs required (submit mode)",
     )
     p.add_argument(
-        "--min-mem", metavar="GB", type=int, default=0,
+        "-m", "--min-mem", metavar="GB", type=int, default=0,
         help="Minimum VRAM per GPU in GB (e.g. 40 for A40/A6000)",
     )
     p.add_argument(

@@ -254,15 +254,21 @@ def db_open() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
+    
+    # Run schema creation
     con.executescript(_SCHEMA)
-    # Migrate existing DBs
-    cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+    
+    # Manual migration for missing columns
+    cursor = con.execute("PRAGMA table_info(tasks)")
+    cols = {row[1] for row in cursor.fetchall()}
+    
     if "retry_count" not in cols:
         con.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
         con.commit()
     if "min_mem" not in cols:
         con.execute("ALTER TABLE tasks ADD COLUMN min_mem INTEGER NOT NULL DEFAULT 0")
         con.commit()
+    
     return con
 
 # ── Daemon ────────────────────────────────────────────────────────────────────

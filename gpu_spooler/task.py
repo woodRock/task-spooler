@@ -392,7 +392,7 @@ class Daemon:
         gpu_str  = ",".join(str(i) for i in gpu_indices)
         log_path = LOGS_DIR / f"{task_id}.log"
 
-        # Reserve in DB immediately (prevents double-dispatch on next cycle)
+        # Reserve in DB immediately
         self.con.execute(
             "UPDATE tasks SET status='running', server=?, gpu_indices=?, "
             "started_at=?, log_file=? WHERE id=?",

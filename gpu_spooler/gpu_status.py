@@ -90,7 +90,9 @@ class GpuInfo:
 
     @property
     def is_free(self) -> bool:
-        return len(self.processes) == 0
+        # A GPU is free if no processes are listed AND VRAM usage is very low.
+        # (Some zombie contexts might hold VRAM but not show in pmon).
+        return len(self.processes) == 0 and self.mem_used_mb < 256
 
 @dataclass
 class ServerResult:

@@ -143,7 +143,10 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
     for line in sections["GPU_INFO"]:
         parts = [p.strip() for p in line.split(",")]
         try:
-            gpus[int(parts[0])] = True
+            idx = int(parts[0])
+            mem_used = int(parts[2])
+            # Consider GPU busy if > 256MB VRAM is used, even if no process is in pmon
+            gpus[idx] = (mem_used < 256)
         except (ValueError, IndexError):
             pass
 
@@ -386,7 +389,9 @@ class Daemon:
         inner = (
             f"ls {wdir!r} > /dev/null 2>&1; "
             f"cd {wdir!r} && "
-            f"CUDA_VISIBLE_DEVICES={gpu_str} {row['command']}"
+            f"export CUDA_DEVICE_ORDER=PCI_BUS_ID && "
+            f"export CUDA_VISIBLE_DEVICES={gpu_str} && "
+            f"{row['command']}"
         )
         # Use a login shell AND explicitly source ~/.bashrc.
         # bash -l sources /etc/profile and ~/.bash_profile, but on most Linux
@@ -539,7 +544,7 @@ def _truncate(s: str, n: int) -> str:
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_submit(args) -> None:
-    command = " ".join(args.command)
+    command = shlex.join(args.command)
     working_dir = os.path.abspath(args.dir) if args.dir else os.getcwd()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     con = db_open()

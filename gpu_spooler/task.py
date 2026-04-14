@@ -820,11 +820,29 @@ def cmd_kill_all(args) -> None:
 
 def cmd_clear(args) -> None:
     con = db_open()
+    # Get logs to delete before removing from DB
+    to_delete = con.execute(
+        "SELECT log_file FROM tasks WHERE status IN ('done','failed','killed','cancelled','lost')"
+    ).fetchall()
+    
     n = con.execute(
         "DELETE FROM tasks WHERE status IN ('done','failed','killed','cancelled','lost')"
     ).rowcount
     con.commit()
-    print(f"Removed {n} finished task(s).")
+    
+    # Delete the physical files
+    deleted_files = 0
+    for r in to_delete:
+        if r["log_file"]:
+            p = Path(r["log_file"])
+            if p.exists():
+                try:
+                    p.unlink()
+                    deleted_files += 1
+                except OSError:
+                    pass
+                    
+    print(f"Removed {n} finished task(s) and {deleted_files} log file(s).")
 
 
 def cmd_wait(args) -> None:

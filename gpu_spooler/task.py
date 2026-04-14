@@ -99,13 +99,12 @@ SERVER_INFO = {
 # ── GPU querying ──────────────────────────────────────────────────────────────
 
 _REMOTE_CMD = r"""
-GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu \
+GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu,compute_mode \
     --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR"; exit 1; }
 PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
-PIDS=$(echo "$PMON_OUT" | awk 'NR>2 && $2~/^[0-9]+$/{print $2}' | sort -u | tr '\n' ',')
-PIDS="${PIDS%,}"
-printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$PMON_OUT"
-if [ -n "$PIDS" ]; then ps -o pid=,user= -p "$PIDS" 2>/dev/null || true; fi
+# Get PIDs from compute apps as well, more reliable than pmon for idle processes
+APPS_OUT=$(nvidia-smi --query-compute-apps=gpu_index,pid --format=csv,noheader 2>/dev/null)
+printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nAPPS_INFO\n%s\n' "$GPU_OUT" "$PMON_OUT" "$APPS_OUT"
 printf 'END\n'
 """
 
@@ -127,7 +126,7 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
     except (subprocess.TimeoutExpired, OSError):
         return None
 
-    SENTINELS = {"GPU_INFO", "PMON_INFO", "PROC_INFO"}
+    SENTINELS = {"GPU_INFO", "PMON_INFO", "APPS_INFO", "PROC_INFO"}
     sections: dict[str, list[str]] = {s: [] for s in SENTINELS}
     cur = None
     for line in r.stdout.splitlines():
@@ -145,16 +144,27 @@ def _query_server_free_gpus(server: str) -> Optional[dict[int, bool]]:
         try:
             idx = int(parts[0])
             mem_used = int(parts[2])
-            # Consider GPU busy if > 256MB VRAM is used, even if no process is in pmon
-            gpus[idx] = (mem_used < 256)
+            # Consider GPU busy if > 128MB VRAM is used, even if no process is in pmon
+            # Stricter than before (256MB) to catch even small idle contexts.
+            gpus[idx] = (mem_used < 128)
         except (ValueError, IndexError):
             pass
 
+    # Mark busy if any process is seen in pmon
     for line in sections["PMON_INFO"]:
         if line.lstrip().startswith("#"):
             continue
         parts = line.split()
         if len(parts) >= 2 and parts[1].isdigit():
+            try:
+                gpus[int(parts[0])] = False
+            except ValueError:
+                pass
+
+    # Mark busy if any process is seen in compute apps (catches idle contexts)
+    for line in sections["APPS_INFO"]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0].isdigit():
             try:
                 gpus[int(parts[0])] = False
             except ValueError:
@@ -189,7 +199,12 @@ def assign_tasks(task_rows, server_gpus: dict[str, dict[int, bool]]) -> list[tup
     assignments = []
     for row in task_rows:
         n = row["num_gpus"]
+        min_mem = row.get("min_mem", 0) or 0
         for server in servers_by_size:
+            info = SERVER_INFO.get(server, {})
+            if info.get("gpu_mem_gb", 0) < min_mem:
+                continue
+
             free = [i for i, ok in sorted(server_gpus[server].items()) if ok]
             if len(free) >= n:
                 chosen = free[:n]
@@ -206,6 +221,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     command      TEXT    NOT NULL,
     num_gpus     INTEGER NOT NULL DEFAULT 1,
+    min_mem      INTEGER NOT NULL DEFAULT 0,
     status       TEXT    NOT NULL DEFAULT 'queued',
     server       TEXT,
     gpu_indices  TEXT,
@@ -231,10 +247,13 @@ def db_open() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(_SCHEMA)
-    # Migrate existing DBs that pre-date the retry_count column
+    # Migrate existing DBs
     cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
     if "retry_count" not in cols:
         con.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        con.commit()
+    if "min_mem" not in cols:
+        con.execute("ALTER TABLE tasks ADD COLUMN min_mem INTEGER NOT NULL DEFAULT 0")
         con.commit()
     return con
 
@@ -386,9 +405,13 @@ class Daemon:
         # `ls` the path first so autofs/NFS automounts have a chance to mount
         # the filesystem before the cd. Without this, non-interactive SSH
         # sessions see the directory as missing on automount-based systems.
+        # Added a short sleep for multi-GPU tasks to reduce chance of torchrun
+        # port collisions if multiple tasks are launched simultaneously.
+        delay = "sleep 2; " if len(gpu_indices) > 1 else ""
         inner = (
             f"ls {wdir!r} > /dev/null 2>&1; "
             f"cd {wdir!r} && "
+            f"{delay}"
             f"export CUDA_DEVICE_ORDER=PCI_BUS_ID && "
             f"export CUDA_VISIBLE_DEVICES={gpu_str} && "
             f"{row['command']}"
@@ -549,15 +572,15 @@ def cmd_submit(args) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     con = db_open()
     cur = con.execute(
-        "INSERT INTO tasks (command, num_gpus, submitted_at, working_dir, name) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (command, args.gpus, time.time(), working_dir, args.name),
+        "INSERT INTO tasks (command, num_gpus, min_mem, submitted_at, working_dir, name) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (command, args.gpus, args.min_mem, time.time(), working_dir, args.name),
     )
     con.commit()
     task_id = cur.lastrowid
     label = f'  "{args.name}"' if args.name else ""
     print(f"Queued task {task_id}{label}: {command}")
-    print(f"  Requires: {args.gpus} GPU(s)   Working dir: {working_dir}")
+    print(f"  Requires: {args.gpus} GPU(s) (min {args.min_mem or 0}GB VRAM)   Working dir: {working_dir}")
 
     start_daemon(quiet=True)
 
@@ -893,6 +916,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-G", "--gpus", metavar="N", type=int,
         help="Number of GPUs required (submit mode)",
+    )
+    p.add_argument(
+        "--min-mem", metavar="GB", type=int, default=0,
+        help="Minimum VRAM per GPU in GB (e.g. 40 for A40/A6000)",
     )
     p.add_argument(
         "-n", "--name", metavar="LABEL",

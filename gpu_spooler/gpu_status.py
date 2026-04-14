@@ -92,7 +92,7 @@ class GpuInfo:
     def is_free(self) -> bool:
         # A GPU is free if no processes are listed AND VRAM usage is very low.
         # (Some zombie contexts might hold VRAM but not show in pmon).
-        return len(self.processes) == 0 and self.mem_used_mb < 256
+        return len(self.processes) == 0 and self.mem_used_mb < 128
 
 @dataclass
 class ServerResult:
@@ -126,19 +126,17 @@ class ServerResult:
 # ---------------------------------------------------------------------------
 
 # Single bash command run remotely; sections delimited by sentinel lines.
-# Uses `nvidia-smi pmon` (not --query-compute-apps) so that ALL GPU processes
-# are detected — compute, graphics, OpenCL, display, etc.
 REMOTE_CMD = r"""
-GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu \
+GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu,compute_mode \
     --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR: nvidia-smi failed"; exit 1; }
 
 PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
+APPS_OUT=$(nvidia-smi --query-compute-apps=gpu_index,pid --format=csv,noheader 2>/dev/null)
 
-# Extract unique PIDs from pmon (skip header comment lines, skip '-' no-process entries)
-PIDS=$(echo "$PMON_OUT" | awk 'NR>2 && $2~/^[0-9]+$/{print $2}' | sort -u | tr '\n' ',')
+printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nAPPS_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$PMON_OUT" "$APPS_OUT"
+# Extract unique PIDs from pmon and apps
+PIDS=$(printf "%s\n%s" "$PMON_OUT" "$APPS_OUT" | awk 'NR>2 && $2~/^[0-9]+$/{print $2}' | sort -u | tr '\n' ',')
 PIDS="${PIDS%,}"
-
-printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nPROC_INFO\n' "$GPU_OUT" "$PMON_OUT"
 if [ -n "$PIDS" ]; then
     ps -o pid=,user= -p "$PIDS" 2>/dev/null || true
 fi
@@ -180,7 +178,7 @@ def ssh_run(server: str, timeout: int = 20, debug: bool = False) -> tuple[bool, 
 
 def parse_output(raw: str) -> list[GpuInfo]:
     """Parse the structured output from REMOTE_CMD into GpuInfo objects."""
-    SENTINELS = {"GPU_INFO", "PMON_INFO", "PROC_INFO"}
+    SENTINELS = {"GPU_INFO", "PMON_INFO", "APPS_INFO", "PROC_INFO"}
     sections: dict[str, list[str]] = {s: [] for s in SENTINELS}
     current = None
     for line in raw.splitlines():
@@ -213,10 +211,10 @@ def parse_output(raw: str) -> list[GpuInfo]:
         except (ValueError, IndexError):
             continue
 
-    # --- pmon rows: gpu pid type sm% mem% enc% dec% fb_mb command ---
-    # Header lines start with '#'; skip them.  A '-' pid means no process.
-    # Example data line:  "    0    1234    C   45   23    0    0  400  python3"
-    pid_to_gpu: dict[int, tuple[int, int, str]] = {}  # pid -> (gpu_idx, fb_mb, cmd_name)
+    # --- pmon and apps info ---
+    # pid -> (gpu_idx, fb_mb, cmd_name)
+    pid_to_gpu: dict[int, tuple[int, int, str]] = {}
+    
     for line in sections["PMON_INFO"]:
         if line.lstrip().startswith("#"):
             continue
@@ -224,17 +222,29 @@ def parse_output(raw: str) -> list[GpuInfo]:
         if len(parts) < 9:
             continue
         if not parts[1].isdigit():
-            continue                          # '-' entry = no process on this GPU
+            continue
         try:
             gpu_idx = int(parts[0])
             pid     = int(parts[1])
             fb_mb   = int(parts[7]) if parts[7].isdigit() else 0
-            cmd     = parts[8]               # pmon already gives the command name
+            cmd     = parts[8]
             pid_to_gpu[pid] = (gpu_idx, fb_mb, cmd)
         except (ValueError, IndexError):
             continue
 
-    # --- proc info rows: pid user (we asked ps for pid= user= only) ---
+    for line in sections["APPS_INFO"]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            gpu_idx = int(parts[0])
+            pid     = int(parts[1])
+            if pid not in pid_to_gpu:
+                pid_to_gpu[pid] = (gpu_idx, 0, "unknown")
+        except (ValueError, IndexError):
+            continue
+
+    # --- proc info rows: pid user ---
     pid_user: dict[int, str] = {}
     for line in sections["PROC_INFO"]:
         parts = line.split()

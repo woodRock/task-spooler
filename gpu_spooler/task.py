@@ -101,7 +101,7 @@ SERVER_INFO = {
 _REMOTE_CMD = r"""
 GPU_OUT=$(nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu,compute_mode \
     --format=csv,noheader,nounits 2>/dev/null) || { echo "ERROR: nvidia-smi failed"; exit 1; }
-PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
+PMON_OUT=$(nvidia-smi pmon -c 1 -d 1 2>/dev/null)
 APPS_OUT=$(nvidia-smi --query-compute-apps=gpu_index,pid --format=csv,noheader 2>/dev/null)
 printf 'GPU_INFO\n%s\nPMON_INFO\n%s\nAPPS_INFO\n%s\n' "$GPU_OUT" "$PMON_OUT" "$APPS_OUT"
 printf 'END\n'
@@ -200,7 +200,6 @@ def assign_tasks(task_rows, server_gpus: dict[str, dict[int, bool]]) -> list[tup
     assignments = []
     for row in task_rows:
         n = row["num_gpus"]
-        # sqlite3.Row doesn't support .get(), use bracket access
         try:
             min_mem = row["min_mem"]
         except (IndexError, KeyError, sqlite3.OperationalError):
@@ -209,10 +208,12 @@ def assign_tasks(task_rows, server_gpus: dict[str, dict[int, bool]]) -> list[tup
         
         for server in servers_by_size:
             info = SERVER_INFO.get(server, {})
-            if info.get("gpu_mem_gb", 0) < min_mem:
+            server_mem = info.get("gpu_mem_gb", 0)
+            if server_mem < min_mem:
                 continue
 
-            free = [i for i, ok in sorted(server_gpus[server].items()) if ok]
+            gpus_dict = server_gpus[server]
+            free = [i for i, ok in sorted(gpus_dict.items()) if ok]
             if len(free) >= n:
                 chosen = free[:n]
                 for idx in chosen:
@@ -375,6 +376,10 @@ class Daemon:
                         reachable[r["server"]][int(idx_str)] = False
                     except (ValueError, KeyError):
                         pass
+
+        # Summary of availability
+        avail_msg = ", ".join(f"{s}:{sum(g.values())}" for s, g in sorted(reachable.items()))
+        self._log(f"Free GPUs: {avail_msg}")
 
         assignments = assign_tasks(rows, reachable)
         if not assignments:
